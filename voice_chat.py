@@ -1,7 +1,9 @@
 """Signed, bounded phone conversations with explicit keypad confirmation."""
 import json
 import os
+import re
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -10,7 +12,31 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 
 POOL = ThreadPoolExecutor(max_workers=2)
-MAX_TURNS = 2
+def uses_openai():
+    return os.getenv('MALAK_REPLY_MODE', 'local') == 'openai'
+
+
+def max_turns():
+    return 2 if uses_openai() else 4
+
+
+def local_reply(speech, title):
+    text = ''.join(c for c in unicodedata.normalize('NFD', speech) if unicodedata.category(c) != 'Mn')
+    text = text.replace('ى', 'ي').replace('ة', 'ه')
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = ' '.join(text.split())
+    if any(w in text for w in ('وش المهمه', 'ايش المهمه', 'ماهي المهمه', 'ما هي المهمه', 'ذكريني', 'عن ايش', 'وش المطلوب')):
+        return 'نتكلم عن: ' + title[:180] + '. إذا أنهيتها، اضغط واحد لحفظ تأكيدك.'
+    # Negation takes precedence over positive completion words.
+    if re.search(r'\b(لا|ما|مو|مش|لم|ماني|لسه|لسا|باقي|بعدني)\b', text) or any(w in text for w in ('ماخلص', 'ماانته', 'موخلص', 'مخلصتش', 'مازلت', 'ما زلت')):
+        return 'تمام، ما راح أحفظ تأكيد إنجاز. خذ وقتك، واضغط تسعة لإنهاء المكالمة بدون تأكيد.'
+    if any(w in text for w in ('خلصت', 'انتهيت', 'انجزت', 'سويت', 'نعم', 'ايوه', 'ايوا', 'اي نعم', 'تمت')) or text in ('اي', 'تم', 'اكيـد', 'اكيد'):
+        return 'يعطيك العافية! فهمت أنك أنهيت المهمة. لحفظ هذا التأكيد اضغط واحد من لوحة أرقام الجوال.'
+    if any(w in text for w in ('تسمع', 'اسمع', 'الصوت', 'مرحبا', 'هلا', 'السلام')):
+        return 'هلا فيك، وصلني كلامك. أنا ملاك بردود عربية جاهزة. هل أنهيت المهمة؟ قل خلصت أو ما خلصت.'
+    if any(w in text for w in ('اكد', 'تاكيد', 'كيف', 'ساعد')):
+        return 'تقدر تقول خلصت أو ما خلصت، أو تسألني وش المهمة. حفظ التأكيد يكون بضغط واحد، والإلغاء بضغط تسعة.'
+    return 'ما فهمت ردك بوضوح. أنا أستخدم ردودا جاهزة. قل خلصت أو ما خلصت، أو اسألني وش المهمة.'
 
 
 def init_schema(con):
@@ -23,6 +49,8 @@ def init_schema(con):
 
 
 def ai_reply(history, title):
+    if not uses_openai():
+        return local_reply(history[-1]['content'], title)
     key = os.getenv('OPENAI_API_KEY', '')
     if not key:
         return 'المحادثة الذكية غير مفعلة الآن. تقدر تؤكد بالضغط على واحد.'
@@ -103,7 +131,7 @@ def install_voice(app, db, voice, language):
     def listen(text, turns=0):
         r = VoiceResponse()
         gather = r.gather(
-            input='speech dtmf' if turns < MAX_TURNS else 'dtmf',
+            input='speech dtmf' if turns < max_turns() else 'dtmf',
             action=base() + '/voice/turn', method='POST', num_digits=1,
             language='ar-SA', speech_timeout=2, timeout=8,
         )
@@ -139,8 +167,9 @@ def install_voice(app, db, voice, language):
             return finish('تأكيدك محفوظ في ملاك. مع السلامة.')
         if row['state'] == 'closed':
             return finish('انتهت هذه المحادثة بدون تأكيد. مع السلامة.')
+        notice = 'كلامك يتحول لنص ويرسل إلى OpenAI للرد الذكي.' if uses_openai() else 'أستخدم ردودا عربية جاهزة. تقدر تقول خلصت أو ما خلصت، أو تسألني وش المهمة.'
         return listen('هلا، أنا ملاك، مساعدتك الآلية. ' + row['title'] +
-                      '. تقدر ترد علي بصوتك. كلامك يتحول لنص ويستخدم للرد الذكي داخل ملاك. هل أنهيت المهمة؟', row['turns'])
+                      '. تقدر ترد علي بصوتك. ' + notice + ' هل أنهيت المهمة؟', row['turns'])
 
     @app.post('/voice/turn')
     def voice_turn():
@@ -163,13 +192,23 @@ def install_voice(app, db, voice, language):
             return finish('تم، حفظت تأكيدك في ملاك. مع السلامة.' if digits == '1' else 'تمام، ما حفظت أي تأكيد. مع السلامة.')
         if row['state'] == 'thinking':
             return wait_response()
-        if row['turns'] >= MAX_TURNS:
-            return listen('وصلنا لنهاية المحادثة.', MAX_TURNS)
+        if row['turns'] >= max_turns():
+            return listen('وصلنا لنهاية المحادثة.', max_turns())
         speech = request.form.get('SpeechResult', '').strip()[:500]
         if not speech:
             return listen('ما سمعت ردك بوضوح.', row['turns'])
         history = json.loads(row['history']) + [{'role': 'user', 'content': speech}]
         turn = row['turns'] + 1
+        if not uses_openai():
+            answer = local_reply(speech, row['title'])
+            con = db()
+            try:
+                con.execute("UPDATE voice_calls SET turns=?, history=? WHERE sid=? AND state='listening' AND turns=?",
+                            (turn, json.dumps(history + [{'role': 'assistant', 'content': answer}], ensure_ascii=False), row['sid'], row['turns']))
+                con.commit()
+            finally:
+                con.close()
+            return listen(answer, turn)
         con = db()
         try:
             changed = con.execute("UPDATE voice_calls SET state='thinking', turns=?, started=? "

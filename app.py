@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from flask import Flask, request, session, redirect, url_for, render_template_string, flash, abort, Response
 from twilio.rest import Client
-from voice_chat import init_schema, install_voice
+from voice_chat import init_schema, install_voice, uses_openai
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-only-change-before-deploy")
@@ -48,8 +48,11 @@ small{color:#666}.flash{background:#fff1bd;padding:12px;border-radius:9px}
 {% else %}<p>ما عندك مهام بعد.</p>{% endfor %}</section>
 <section class="card"><h2>محادثة ملاك والتأكيد</h2>
 <p>تسمع ملاك ردك بالعربية وتجاوبك. اضغط 1 أثناء المكالمة لحفظ التأكيد، أو 9 للإنهاء دون تأكيد.</p>
-<p>قد تسمع مقدمة Twilio التجريبية أولًا. يتم تحويل كلامك إلى نص وإرساله إلى OpenAI للرد، دون تسجيل صوتي في التطبيق.</p>
-<p>{% if ai_ready %}الربط الذكي مضبوط؛ الردود تتطلب رصيد API متاحًا.{% else %}الرد الذكي ينتظر إعداد مفتاح OpenAI. تأكيد الأرقام متاح.{% endif %}</p>
+{% if local_mode %}<p>الردود العربية الجاهزة مفعلة دون الحاجة لرصيد OpenAI. قل «خلصت» أو «ما خلصت» أو «وش المهمة؟». هذه محادثة محدودة بردود جاهزة.</p>
+<p>يحوّل Twilio كلامك إلى نص لمعالجته داخل ملاك؛ لا يُرسل النص إلى OpenAI في هذا الوضع.</p>
+{% else %}<p>يتم تحويل كلامك إلى نص وإرساله إلى OpenAI للرد، دون تسجيل صوتي في التطبيق.</p>
+<p>{% if ai_ready %}الربط الذكي مضبوط؛ الردود تتطلب رصيد API متاحًا.{% else %}الرد الذكي ينتظر إعداد مفتاح OpenAI. تأكيد الأرقام متاح.{% endif %}</p>{% endif %}
+<p>قد تسمع مقدمة Twilio التجريبية أولًا. اضغط أي رقم إذا طلبت ذلك، ثم انتظر رسالة ملاك.</p>
 <p>المكالمة الفعلية تتطلب إعداد Twilio وقد تترتب عليها رسوم.</p>
 <form method="post" action="/test-call"><input type="hidden" name="csrf" value="{{csrf}}">
 <label><input type="checkbox" name="confirm" value="yes" required style="width:auto"> أوافق على طلب مكالمة تجريبية لرقمي</label>
@@ -118,7 +121,7 @@ def index():
         calls = con.execute("SELECT title,created_at,confirmed_at,state,history FROM voice_calls ORDER BY created_at DESC, rowid DESC LIMIT 10").fetchall() if authenticated() else []
     finally:
         con.close()
-    return render_template_string(PAGE, logged_in=authenticated(), tasks=tasks, calls=calls, ai_ready=bool(os.getenv("OPENAI_API_KEY")), temporary_storage=str(DB).startswith("/tmp/"), csrf=session.get("csrf", ""))
+    return render_template_string(PAGE, logged_in=authenticated(), tasks=tasks, calls=calls, ai_ready=uses_openai() and bool(os.getenv("OPENAI_API_KEY")), local_mode=not uses_openai(), temporary_storage=str(DB).startswith("/tmp/"), csrf=session.get("csrf", ""))
 
 @app.post("/login")
 def login():

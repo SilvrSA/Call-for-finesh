@@ -26,6 +26,7 @@ class VoiceTests(unittest.TestCase):
             'TWILIO_AUTH_TOKEN': 'test-token', 'RENDER_EXTERNAL_URL': 'https://malak.example',
             'TWILIO_ACCOUNT_SID': 'ACtest', 'TWILIO_FROM_NUMBER': '+15555550100',
             'MALAK_TO_NUMBER': '+15555550101',
+            'MALAK_REPLY_MODE': 'openai',
         })
         self.env.start()
         self.client = module.app.test_client()
@@ -111,6 +112,29 @@ class VoiceTests(unittest.TestCase):
             result = voice_chat.ai_reply([{'role': 'user', 'content': 'خلصت'}], 'اختبار')
         self.assertIn('واحد', result)
         self.assertIsNone(self.row()['confirmed_at'])
+
+    def test_local_mode_understands_arabic_without_network_or_auto_confirmation(self):
+        with patch.dict(os.environ, {'MALAK_REPLY_MODE': 'local'}), patch.object(voice_chat.urllib.request, 'urlopen') as remote:
+            for phrase, expected in [('خَلَصْت', 'يعطيك العافية'), ('ما خلصت', 'ما راح أحفظ'), ('ماخلصت', 'ما راح أحفظ'), ('خلصت بس باقي شغلة', 'ما راح أحفظ'), ('وش المهمة؟', 'مهمة اختبار'), ('ما هي المهمة', 'مهمة اختبار'), ('شيء غير مفهوم', 'ما فهمت')]:
+                self.assertIn(expected, voice_chat.local_reply(phrase, 'مهمة اختبار'))
+            response = self.post('/voice/turn', SpeechResult='خلصت المهمة')
+            self.assertIn('يعطيك العافية', response.data.decode())
+            self.assertIsNone(ET.fromstring(response.data).find('Redirect'))
+            self.assertIsNone(self.row()['confirmed_at'])
+            self.assertEqual(self.row()['turns'], 1)
+            remote.assert_not_called()
+            self.post('/voice/turn', Digits='1')
+            self.assertIsNotNone(self.row()['confirmed_at'])
+
+    def test_local_mode_is_default_and_dashboard_describes_it(self):
+        with patch.dict(os.environ, {'MALAK_REPLY_MODE': ''}):
+            os.environ.pop('MALAK_REPLY_MODE')
+            self.assertFalse(voice_chat.uses_openai())
+            with self.client.session_transaction() as session:
+                session['logged_in'] = True
+            text = self.client.get('/').data.decode()
+            self.assertIn('الردود العربية الجاهزة مفعلة', text)
+            self.assertNotIn('الردود تتطلب رصيد API', text)
 
 
 if __name__ == '__main__':
