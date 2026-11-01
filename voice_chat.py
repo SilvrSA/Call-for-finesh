@@ -23,6 +23,28 @@ def max_turns():
     return 2 if uses_openai() else 4
 
 
+def callback_fields():
+    """Normalize standard form callbacks and trial-proxy JSON/query callbacks."""
+    data = request.get_json(silent=True)
+    data = data if isinstance(data, dict) else {}
+    fields = {}
+    for name, aliases in {
+        'CallSid': ('CallSid', 'callSid', 'call_sid'),
+        'SpeechResult': ('SpeechResult', 'speechResult', 'speech_result'),
+        'Digits': ('Digits', 'digits'),
+    }.items():
+        fields[name] = ''
+        for source in (request.form, data, request.args):
+            for alias in aliases:
+                value = source.get(alias)
+                if isinstance(value, (str, int)) and str(value).strip():
+                    fields[name] = str(value).strip()
+                    break
+            if fields[name]:
+                break
+    return fields
+
+
 def local_reply(speech, title):
     text = ''.join(c for c in unicodedata.normalize('NFD', speech) if unicodedata.category(c) != 'Mn')
     text = text.replace('ى', 'ي').replace('ة', 'ه')
@@ -117,7 +139,7 @@ def install_voice(app, db, voice, language):
         url = base() + request.full_path.rstrip('?')
         signed = bool(token) and RequestValidator(token).validate(
                 url, request.form, request.headers.get('X-Twilio-Signature', ''))
-        sid = request.form.get('CallSid', '')
+        sid = callback_fields()['CallSid']
         ticket = request.args.get('ticket', '')
         if not signed and (not ticket or len(ticket) > 100):
             abort(403)
@@ -202,7 +224,10 @@ def install_voice(app, db, voice, language):
             return finish('تأكيدك محفوظ في ملاك. مع السلامة.')
         if row['state'] == 'closed':
             return finish('انتهت المحادثة بدون تأكيد. مع السلامة.')
-        digits = request.form.get('Digits', '')
+        fields = callback_fields()
+        digits = fields['Digits']
+        # Safe diagnostics: flags only; never speech, digits, headers or tickets.
+        app.logger.info('Voice input received: speech=%s keypad=%s', bool(fields['SpeechResult']), bool(digits))
         if digits in ('1', '9'):
             con = db()
             try:
@@ -218,7 +243,7 @@ def install_voice(app, db, voice, language):
             return wait_response()
         if row['turns'] >= max_turns():
             return listen('وصلنا لنهاية المحادثة.', max_turns())
-        speech = request.form.get('SpeechResult', '').strip()[:500]
+        speech = fields['SpeechResult'][:500]
         if not speech:
             return listen('ما سمعت ردك بوضوح.', row['turns'])
         history = json.loads(row['history']) + [{'role': 'user', 'content': speech}]

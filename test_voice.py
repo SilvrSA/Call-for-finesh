@@ -176,6 +176,25 @@ class VoiceTests(unittest.TestCase):
             self.assertIsNotNone(self.row()['confirmed_at'])
             remote.assert_not_called()
 
+    def test_trial_json_speech_and_numeric_keypad_confirmation(self):
+        ticket = self.ticket()
+        with patch.dict(os.environ, {'MALAK_REPLY_MODE': 'local'}):
+            response = self.client.post('/voice/turn?ticket=' + ticket, json={'callSid': 'CAtest', 'speechResult': 'خلصت'})
+            self.assertIn('يعطيك العافية', response.data.decode())
+            self.assertIsNone(self.row()['confirmed_at'])
+            response = self.client.post('/voice/turn?ticket=' + ticket, json={'callSid': 'CAtest', 'digits': 1})
+            self.assertEqual(response.status_code, 200)
+            self.assertIsNotNone(self.row()['confirmed_at'])
+
+    def test_trial_query_confirmation_and_mismatched_json_call_rejected(self):
+        ticket = self.ticket()
+        response = self.client.post('/voice/turn?ticket=' + ticket, json={'callSid': 'CAother', 'digits': '1'})
+        self.assertEqual(response.status_code, 403)
+        self.assertIsNone(self.row()['confirmed_at'])
+        response = self.client.post('/voice/turn?ticket=' + ticket + '&CallSid=CAtest&Digits=1')
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(self.row()['confirmed_at'])
+
 
 if __name__ == '__main__':
     unittest.main()
