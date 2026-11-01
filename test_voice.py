@@ -99,7 +99,9 @@ class VoiceTests(unittest.TestCase):
         with patch.object(module, 'Client') as client:
             client.return_value.calls.create.return_value.sid = 'CAcreated'
             module.phone_call(1)
-            self.assertEqual(client.return_value.calls.create.call_args.kwargs['url'], 'https://malak.example/voice')
+            url = client.return_value.calls.create.call_args.kwargs['url']
+            self.assertTrue(url.startswith('https://malak.example/voice?ticket='))
+            self.assertGreater(len(url.split('ticket=')[1]), 40)
         con = module.db()
         row = con.execute("SELECT * FROM voice_calls WHERE sid='CAcreated'").fetchone()
         con.close()
@@ -135,6 +137,44 @@ class VoiceTests(unittest.TestCase):
             text = self.client.get('/').data.decode()
             self.assertIn('الردود العربية الجاهزة مفعلة', text)
             self.assertNotIn('الردود تتطلب رصيد API', text)
+
+    def ticket(self):
+        import hashlib
+        con = module.db()
+        con.execute("UPDATE voice_calls SET ticket_digest=? WHERE sid='CAtest'", (hashlib.sha256(b'test-call-ticket').hexdigest(),))
+        con.commit()
+        con.close()
+        return 'test-call-ticket'
+
+    def test_trial_ticket_starts_voice_and_preserves_ticket_in_gather(self):
+        ticket = self.ticket()
+        response = self.client.post('/voice?ticket=' + ticket, data={'CallSid': 'CAtest'})
+        self.assertEqual(response.status_code, 200)
+        gather = ET.fromstring(response.data).find('Gather')
+        self.assertEqual(gather.get('action'), 'https://malak.example/voice/turn?ticket=' + ticket)
+
+    def test_ticket_cannot_be_used_for_another_call_or_after_expiry(self):
+        ticket = self.ticket()
+        self.assertEqual(self.client.post('/voice/turn?ticket=invalid', data={'Digits': '1'}).status_code, 403)
+        self.assertEqual(self.client.post('/voice/turn?ticket=' + ticket, data={'CallSid': 'CAother', 'Digits': '1'}).status_code, 403)
+        con = module.db()
+        con.execute("UPDATE voice_calls SET created_at=datetime('now','-11 minutes')")
+        con.commit()
+        con.close()
+        self.assertEqual(self.client.post('/voice/turn?ticket=' + ticket, data={'CallSid': 'CAtest', 'Digits': '1'}).status_code, 403)
+        self.assertIsNone(self.row()['confirmed_at'])
+
+    def test_trial_ticket_handles_speech_then_explicit_confirmation(self):
+        ticket = self.ticket()
+        with patch.dict(os.environ, {'MALAK_REPLY_MODE': 'local'}), patch.object(voice_chat.urllib.request, 'urlopen') as remote:
+            response = self.client.post('/voice/turn?ticket=' + ticket, data={'CallSid': 'CAtest', 'SpeechResult': 'خلصت'})
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('يعطيك العافية', response.data.decode())
+            self.assertIsNone(self.row()['confirmed_at'])
+            response = self.client.post('/voice/turn?ticket=' + ticket, data={'CallSid': 'CAtest', 'Digits': '1'})
+            self.assertEqual(response.status_code, 200)
+            self.assertIsNotNone(self.row()['confirmed_at'])
+            remote.assert_not_called()
 
 
 if __name__ == '__main__':

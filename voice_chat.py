@@ -1,9 +1,12 @@
 """Signed, bounded phone conversations with explicit keypad confirmation."""
 import json
+import hashlib
+import hmac
 import os
 import re
 import time
 import unicodedata
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +49,9 @@ def init_schema(con):
         confirmed_at TEXT, state TEXT NOT NULL DEFAULT 'listening',
         turns INTEGER NOT NULL DEFAULT 0, history TEXT NOT NULL DEFAULT '[]',
         reply TEXT NOT NULL DEFAULT '', started REAL NOT NULL DEFAULT 0)""")
+    columns = {row[1] for row in con.execute('PRAGMA table_info(voice_calls)')}
+    if 'ticket_digest' not in columns:
+        con.execute("ALTER TABLE voice_calls ADD COLUMN ticket_digest TEXT NOT NULL DEFAULT ''")
 
 
 def ai_reply(history, title):
@@ -109,18 +115,36 @@ def install_voice(app, db, voice, language):
     def signed_call():
         token = os.getenv('TWILIO_AUTH_TOKEN', '')
         url = base() + request.full_path.rstrip('?')
-        if not token or not RequestValidator(token).validate(
-                url, request.form, request.headers.get('X-Twilio-Signature', '')):
-            abort(403)
+        signed = bool(token) and RequestValidator(token).validate(
+                url, request.form, request.headers.get('X-Twilio-Signature', ''))
         sid = request.form.get('CallSid', '')
+        ticket = request.args.get('ticket', '')
+        if not signed and (not ticket or len(ticket) > 100):
+            abort(403)
         con = db()
         try:
-            row = con.execute('SELECT * FROM voice_calls WHERE sid=?', (sid,)).fetchone()
+            if signed:
+                row = con.execute('SELECT * FROM voice_calls WHERE sid=?', (sid,)).fetchone()
+            else:
+                digest = hashlib.sha256(ticket.encode()).hexdigest()
+                row = con.execute('SELECT * FROM voice_calls WHERE ticket_digest=?', (digest,)).fetchone()
         finally:
             con.close()
         if not row:
-            abort(404)
+            abort(404 if signed else 403)
+        if not signed:
+            created = datetime.strptime(row['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
+            valid_digest = hmac.compare_digest(hashlib.sha256(ticket.encode()).hexdigest(), row['ticket_digest'])
+            if not valid_digest or time.time() - created > 600 or (sid and sid != row['sid']):
+                abort(403)
         return row
+
+    def callback(path, **query):
+        from urllib.parse import urlencode
+        ticket = request.args.get('ticket', '')
+        if ticket:
+            query['ticket'] = ticket
+        return base() + path + ('?' + urlencode(query) if query else '')
 
     def finish(text):
         r = VoiceResponse()
@@ -132,7 +156,7 @@ def install_voice(app, db, voice, language):
         r = VoiceResponse()
         gather = r.gather(
             input='speech dtmf' if turns < max_turns() else 'dtmf',
-            action=base() + '/voice/turn', method='POST', num_digits=1,
+            action=callback('/voice/turn'), method='POST', num_digits=1,
             language='ar-SA', speech_timeout=2, timeout=8,
         )
         say(gather, text)
@@ -146,7 +170,7 @@ def install_voice(app, db, voice, language):
         if n == 0:
             say(r, 'ثواني وأرد عليك.')
         r.pause(length=3)
-        r.redirect(base() + '/voice/wait?n=' + str(n + 1), method='POST')
+        r.redirect(callback('/voice/wait', n=n + 1), method='POST')
         return xml(r)
 
     def make_reply(sid, turn, history, title):

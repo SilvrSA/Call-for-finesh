@@ -1,5 +1,7 @@
 import os
 import hmac
+import hashlib
+import secrets
 import sqlite3
 from pathlib import Path
 from flask import Flask, request, session, redirect, url_for, render_template_string, flash, abort, Response
@@ -91,17 +93,18 @@ def phone_call(task_id=None):
     if any(not os.getenv(k) for k in required):
         return "لم تُضبط إعدادات Twilio بعد."
     base_url = os.getenv("RENDER_EXTERNAL_URL", "https://malak-calls.onrender.com").rstrip("/")
+    ticket = secrets.token_urlsafe(32)
     try:
         call = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]).calls.create(
             from_=os.environ["TWILIO_FROM_NUMBER"],
             to=os.environ["MALAK_TO_NUMBER"],
-            url=f"{base_url}/voice"
+            url=f"{base_url}/voice?ticket={ticket}"
         )
         con = db()
         try:
             task = con.execute("SELECT title FROM tasks WHERE id=?", (task_id,)).fetchone() if task_id else None
             title = task["title"] if task else "تجربة المحادثة والتأكيد"
-            con.execute("INSERT INTO voice_calls(sid,task_id,title) VALUES(?,?,?)", (call.sid, task_id, title))
+            con.execute("INSERT INTO voice_calls(sid,task_id,title,ticket_digest) VALUES(?,?,?,?)", (call.sid, task_id, title, hashlib.sha256(ticket.encode()).hexdigest()))
             con.commit()
         finally:
             con.close()
