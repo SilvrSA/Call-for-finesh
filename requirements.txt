@@ -1,0 +1,3 @@
+Flask>=3.0,<4
+Twilio>=9.0,<10
+gunicorn>=22,<24
