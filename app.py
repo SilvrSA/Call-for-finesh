@@ -2,7 +2,7 @@ import os
 import hmac
 import sqlite3
 from pathlib import Path
-from flask import Flask, request, session, redirect, url_for, render_template_string, flash, abort
+from flask import Flask, request, session, redirect, url_for, render_template_string, flash, abort, Response
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
@@ -75,13 +75,12 @@ def phone_call():
     required = ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "MALAK_TO_NUMBER"]
     if any(not os.getenv(k) for k in required):
         return "لم تُضبط إعدادات Twilio بعد."
-    response = VoiceResponse()
-    response.say(CALL_TEXT, voice=VOICE, language=LANG)
+    base_url = os.getenv("RENDER_EXTERNAL_URL", "https://malak-calls.onrender.com").rstrip("/")
     try:
         call = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]).calls.create(
             from_=os.environ["TWILIO_FROM_NUMBER"],
             to=os.environ["MALAK_TO_NUMBER"],
-            twiml=str(response)
+            url=f"{base_url}/voice"
         )
         return f"تم إرسال طلب المكالمة إلى Twilio. رقم الطلب: {call.sid}. هذا لا يؤكد أن المكالمة وصلت أو تم الرد عليها."
     except Exception:
@@ -156,6 +155,12 @@ def test_call():
         abort(400)
     flash(phone_call())
     return redirect(url_for("index"))
+
+@app.route("/voice", methods=["GET", "POST"])
+def voice_instructions():
+    response = VoiceResponse()
+    response.say(CALL_TEXT, voice=VOICE, language=LANG)
+    return Response(str(response), mimetype="application/xml")
 
 @app.get("/health")
 def health():
