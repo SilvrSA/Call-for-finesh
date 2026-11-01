@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from flask import Flask, request, session, redirect, url_for, render_template_string, flash, abort, Response
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse
+from voice_chat import init_schema, install_voice
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-only-change-before-deploy")
@@ -46,11 +46,22 @@ small{color:#666}.flash{background:#fff1bd;padding:12px;border-radius:9px}
 <label><input type="checkbox" name="call" value="1" style="width:auto"> اتصل عند الإنجاز</label>
 <button class="warn">إنهاء</button></form>{% endif %}</div>
 {% else %}<p>ما عندك مهام بعد.</p>{% endfor %}</section>
-<section class="card"><h2>تجربة مكالمة ملاك</h2>
+<section class="card"><h2>محادثة ملاك والتأكيد</h2>
+<p>تسمع ملاك ردك بالعربية وتجاوبك. اضغط 1 أثناء المكالمة لحفظ التأكيد، أو 9 للإنهاء دون تأكيد.</p>
+<p>قد تسمع مقدمة Twilio التجريبية أولًا. يتم تحويل كلامك إلى نص وإرساله إلى OpenAI للرد، دون تسجيل صوتي في التطبيق.</p>
+<p>{% if ai_ready %}الربط الذكي مضبوط؛ الردود تتطلب رصيد API متاحًا.{% else %}الرد الذكي ينتظر إعداد مفتاح OpenAI. تأكيد الأرقام متاح.{% endif %}</p>
 <p>المكالمة الفعلية تتطلب إعداد Twilio وقد تترتب عليها رسوم.</p>
 <form method="post" action="/test-call"><input type="hidden" name="csrf" value="{{csrf}}">
 <label><input type="checkbox" name="confirm" value="yes" required style="width:auto"> أوافق على طلب مكالمة تجريبية لرقمي</label>
 <button>📞 اتصل علي الآن (Test)</button></form></section>
+<section class="card"><h2>سجل المحادثات والتأكيدات</h2>
+{% if temporary_storage %}<p class="flash">السجل والمهام محفوظة مؤقتًا على هذه الاستضافة، وقد تُفقد عند إعادة تشغيلها أو نشر تحديث. يلزم تخزين دائم للاحتفاظ بها.</p>{% endif %}
+{% for c in calls %}<div style="border-bottom:1px solid #eee;padding:12px 0">
+<strong>{{c['title']}}</strong>
+<p>{% if c['confirmed_at'] %}✅ تم تأكيدك وحفظه — {{c['confirmed_at']}} UTC{% elif c['state']=='closed' %}انتهت دون تأكيد{% else %}لم يُحفظ تأكيد بعد{% endif %}</p>
+<small>بدء المكالمة: {{c['created_at']}} UTC</small>
+</div>{% else %}<p>لم تُجرَ محادثات بعد.</p>{% endfor %}
+</section>
 {% endif %}
 </main></body></html>"""
 
@@ -59,6 +70,7 @@ def db():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
+    init_schema(con)
     return con
 
 def authenticated():
@@ -71,7 +83,7 @@ def guard():
     if not sent or not hmac.compare_digest(sent, session.get("csrf", "")):
         abort(403)
 
-def phone_call():
+def phone_call(task_id=None):
     required = ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "MALAK_TO_NUMBER"]
     if any(not os.getenv(k) for k in required):
         return "لم تُضبط إعدادات Twilio بعد."
@@ -82,6 +94,14 @@ def phone_call():
             to=os.environ["MALAK_TO_NUMBER"],
             url=f"{base_url}/voice"
         )
+        con = db()
+        try:
+            task = con.execute("SELECT title FROM tasks WHERE id=?", (task_id,)).fetchone() if task_id else None
+            title = task["title"] if task else "تجربة المحادثة والتأكيد"
+            con.execute("INSERT INTO voice_calls(sid,task_id,title) VALUES(?,?,?)", (call.sid, task_id, title))
+            con.commit()
+        finally:
+            con.close()
         return f"تم إرسال طلب المكالمة إلى Twilio. رقم الطلب: {call.sid}. هذا لا يؤكد أن المكالمة وصلت أو تم الرد عليها."
     except Exception:
         app.logger.exception("Twilio call failed")
@@ -95,9 +115,10 @@ def index():
     con = db()
     try:
         tasks = con.execute("SELECT id,title,done FROM tasks ORDER BY id DESC LIMIT 100").fetchall() if authenticated() else []
+        calls = con.execute("SELECT title,created_at,confirmed_at,state,history FROM voice_calls ORDER BY created_at DESC, rowid DESC LIMIT 10").fetchall() if authenticated() else []
     finally:
         con.close()
-    return render_template_string(PAGE, logged_in=authenticated(), tasks=tasks, csrf=session.get("csrf", ""))
+    return render_template_string(PAGE, logged_in=authenticated(), tasks=tasks, calls=calls, ai_ready=bool(os.getenv("OPENAI_API_KEY")), temporary_storage=str(DB).startswith("/tmp/"), csrf=session.get("csrf", ""))
 
 @app.post("/login")
 def login():
@@ -143,7 +164,7 @@ def complete_task(task_id):
             con.execute("UPDATE tasks SET done=1 WHERE id=?", (task_id,))
             con.commit()
             if request.form.get("call") == "1":
-                flash(phone_call())
+                flash(phone_call(task_id))
     finally:
         con.close()
     return redirect(url_for("index"))
@@ -156,11 +177,7 @@ def test_call():
     flash(phone_call())
     return redirect(url_for("index"))
 
-@app.route("/voice", methods=["GET", "POST"])
-def voice_instructions():
-    response = VoiceResponse()
-    response.say(CALL_TEXT, voice=VOICE, language=LANG)
-    return Response(str(response), mimetype="application/xml")
+install_voice(app, db, VOICE, LANG)
 
 @app.get("/health")
 def health():
